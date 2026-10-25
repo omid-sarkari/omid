@@ -1,0 +1,219 @@
+name: Prepare WordPress and WooCommerce environment
+
+on:
+  push:
+    paths:
+      - ".github/workflows/prepare-wp-wc-environment.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: Install WordPress, WooCommerce, WP-CLI and MariaDB
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    services:
+      mariadb:
+        image: mariadb:11.4
+        env:
+          MARIADB_ROOT_PASSWORD: root_local_only
+          MARIADB_DATABASE: wordpress
+          MARIADB_USER: wp
+          MARIADB_PASSWORD: wp_local_only
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
+
+    steps:
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mariadb-client zip unzip
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: curl, dom, fileinfo, gd, intl, mbstring, mysqli, soap, zip
+          coverage: none
+
+      - name: Resolve latest stable release tags from GitHub
+        id: versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          WP_TAG="$(git ls-remote --tags --refs https://github.com/WordPress/WordPress.git \
+            | sed 's#.*refs/tags/##' \
+            | grep -E '^[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+            | sort -V | tail -n 1)"
+          WC_TAG="$(git ls-remote --tags --refs https://github.com/woocommerce/woocommerce.git \
+            | sed 's#.*refs/tags/##' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V | tail -n 1)"
+          test -n "$WP_TAG"
+          test -n "$WC_TAG"
+          echo "WP_TAG=$WP_TAG" >> "$GITHUB_ENV"
+          echo "WC_TAG=$WC_TAG" >> "$GITHUB_ENV"
+          echo "WordPress tag: $WP_TAG"
+          echo "WooCommerce tag: $WC_TAG"
+
+      - name: Download WordPress distribution from GitHub
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/wp-unpack" "$GITHUB_WORKSPACE/bundle/wordpress"
+          curl --fail --location --retry 4 --retry-delay 2 \
+            "https://github.com/WordPress/WordPress/archive/refs/tags/$WP_TAG.zip" \
+            --output "$RUNNER_TEMP/wordpress.zip"
+          unzip -q "$RUNNER_TEMP/wordpress.zip" -d "$RUNNER_TEMP/wp-unpack"
+          WP_SOURCE="$(find "$RUNNER_TEMP/wp-unpack" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          test -n "$WP_SOURCE"
+          cp -a "$WP_SOURCE/." "$GITHUB_WORKSPACE/bundle/wordpress/"
+
+      - name: Download WP-CLI PHAR from GitHub
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/bundle/tools" "$GITHUB_WORKSPACE/bundle/database"
+          curl --fail --location --retry 4 --retry-delay 2 \
+            "https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar" \
+            --output "$GITHUB_WORKSPACE/bundle/tools/wp-cli.phar"
+          php "$GITHUB_WORKSPACE/bundle/tools/wp-cli.phar" --info
+
+      - name: Install and activate WooCommerce
+        shell: bash
+        run: |
+          set -euo pipefail
+          WP_DIR="$GITHUB_WORKSPACE/bundle/wordpress"
+          mkdir -p "$WP_DIR/wp-content/plugins"
+          curl --fail --location --retry 4 --retry-delay 2 \
+            "https://downloads.wordpress.org/plugin/woocommerce.$WC_TAG.zip" \
+            --output "$RUNNER_TEMP/woocommerce.zip"
+          unzip -q "$RUNNER_TEMP/woocommerce.zip" -d "$WP_DIR/wp-content/plugins"
+
+          # This disposable database and password are only for assembling the artifact.
+          php "$GITHUB_WORKSPACE/bundle/tools/wp-cli.phar" config create \
+            --path="$WP_DIR" \
+            --dbname=wordpress \
+            --dbuser=wp \
+            --dbpass=wp_local_only \
+            --dbhost=127.0.0.1:3306 \
+            --skip-check
+
+          ADMIN_PASS="$(openssl rand -hex 24)"
+          php "$GITHUB_WORKSPACE/bundle/tools/wp-cli.phar" core install \
+            --path="$WP_DIR" \
+            --url="http://localhost:8080" \
+            --title="Chandbazar Local Environment" \
+            --admin_user=chandbazar_admin \
+            --admin_password="$ADMIN_PASS" \
+            --admin_email="admin@example.invalid" \
+            --skip-email
+
+          php "$GITHUB_WORKSPACE/bundle/tools/wp-cli.phar" plugin activate woocommerce --path="$WP_DIR"
+          php "$GITHUB_WORKSPACE/bundle/tools/wp-cli.phar" db export \
+            "$GITHUB_WORKSPACE/bundle/database/wordpress.sql" \
+            --path="$WP_DIR"
+
+          # Do not ship runner-only credentials or generated auth salts.
+          rm -f "$WP_DIR/wp-config.php"
+
+          {
+            echo "WordPress tag: $WP_TAG"
+            echo "WooCommerce tag: $WC_TAG"
+            echo "PHP version:"
+            php --version | head -n 1
+            echo "WP-CLI version:"
+            php "$GITHUB_WORKSPACE/bundle/tools/wp-cli.phar" --info | head -n 8
+            echo "Installed WordPress version:"
+            php "$GITHUB_WORKSPACE/bundle/tools/wp-cli.phar" core version --path="$WP_DIR"
+            echo "Installed WooCommerce plugin header:"
+            grep -m 1 -E '^[[:space:]]*\*?[[:space:]]*Version:' "$WP_DIR/wp-content/plugins/woocommerce/woocommerce.php" || true
+            echo "Database: MariaDB 11.4 service; SQL dump saved to database/wordpress.sql"
+            echo "WordPress source: https://github.com/WordPress/WordPress"
+            echo "WooCommerce install package: https://downloads.wordpress.org/plugin/woocommerce.$WC_TAG.zip"
+            echo "WP-CLI PHAR source: https://github.com/wp-cli/builds"
+          } > "$GITHUB_WORKSPACE/bundle/MANIFEST.txt"
+
+      - name: Add portable Docker Compose launcher and instructions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$GITHUB_WORKSPACE/bundle/compose.yml" <<'YAML'
+          services:
+            db:
+              image: mariadb:11.4
+              environment:
+                MARIADB_ROOT_PASSWORD: root_local_only
+                MARIADB_DATABASE: wordpress
+                MARIADB_USER: wp
+                MARIADB_PASSWORD: wp_local_only
+              volumes:
+                - db_data:/var/lib/mysql
+                - ./database/wordpress.sql:/docker-entrypoint-initdb.d/10-wordpress.sql:ro
+              healthcheck:
+                test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+                interval: 10s
+                timeout: 5s
+                retries: 12
+            wordpress:
+              image: wordpress:php8.3-apache
+              depends_on:
+                db:
+                  condition: service_healthy
+              ports:
+                - "8080:80"
+              environment:
+                WORDPRESS_DB_HOST: db:3306
+                WORDPRESS_DB_USER: wp
+                WORDPRESS_DB_PASSWORD: wp_local_only
+                WORDPRESS_DB_NAME: wordpress
+              volumes:
+                - ./wordpress:/var/www/html
+                - ./tools/wp-cli.phar:/usr/local/bin/wp-cli.phar:ro
+          volumes:
+            db_data:
+          YAML
+
+          cat > "$GITHUB_WORKSPACE/bundle/README-RESTORE.md" <<'DOC'
+          # Chandbazar WordPress environment bundle
+
+          This bundle was assembled by GitHub Actions. See MANIFEST.txt for the exact resolved versions.
+
+          ## Start locally with Docker
+
+          1. Install Docker Engine/Desktop and the Docker Compose plugin.
+          2. Extract this artifact archive.
+          3. From the extracted bundle directory, run: docker compose -f compose.yml up -d
+          4. Open http://localhost:8080.
+
+          The database dump contains a temporary local-only WordPress admin account named chandbazar_admin.
+          For safety, its original password is not included. Reset it from inside the running container with:
+
+              docker compose -f compose.yml exec wordpress php /usr/local/bin/wp-cli.phar user update chandbazar_admin --user_pass='CHOOSE_A_NEW_PASSWORD' --path=/var/www/html
+
+          WP-CLI is included at tools/wp-cli.phar. The wp-config.php generated on the CI runner was deliberately removed; the official WordPress container creates a local configuration from the Compose environment variables.
+
+          The Compose credentials are for local development only. Do not expose this setup to the public internet or reuse these credentials in production.
+          DOC
+
+          printf '%s\n' \
+            "WordPress release tags were resolved from https://github.com/WordPress/WordPress" \
+            "WooCommerce release tags were resolved from https://github.com/woocommerce/woocommerce" \
+            "WP-CLI binary was fetched from https://github.com/wp-cli/builds" \
+            > "$GITHUB_WORKSPACE/bundle/PROVENANCE.txt"
+
+      - name: Upload prepared environment bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: chandbazar-wordpress-woocommerce-environment
+          path: bundle/
+          if-no-files-found: error
+          retention-days: 14
