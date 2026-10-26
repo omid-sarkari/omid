@@ -79,6 +79,40 @@ jobs:
           php /tmp/wp-cli.phar plugin activate chandbazar --path=/tmp/wp/wordpress
           php /tmp/wp-cli.phar cbz status --path=/tmp/wp/wordpress
           php /tmp/wp-cli.phar eval 'global $wpdb; foreach (array("accounts","product_map","order_map","operations","logs") as $t) { $n=$wpdb->prefix."chandbazar_".$t; if ($wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s",$n)) !== $n) { WP_CLI::error("Missing table: ".$n); } } WP_CLI::success("All ChandBazaar tables exist.");' --path=/tmp/wp/wordpress
+          cat > /tmp/chandbazar-queue-test.php <<'PHP'
+          <?php
+          global $wpdb;
+          $table = $wpdb->prefix . 'chandbazar_operations';
+          $workerA = str_repeat('a', 32);
+          $workerB = str_repeat('b', 32);
+          $workerC = str_repeat('c', 32);
+          $key = \\CBZ\\Sync\\Operations::enqueue(777, 'ci_stock', 888, array('qty' => 5));
+          $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$table} WHERE account_id=%d AND operation_key=%s", 777, $key), ARRAY_A);
+          if (!$row || $row['status'] !== 'pending') { WP_CLI::error('Queue enqueue did not create pending operation.'); }
+          $claimA = \\CBZ\\Sync\\Operations::claimNext($workerA, 30);
+          if (!$claimA || $claimA['claimed_by'] !== $workerA) { WP_CLI::error('Worker A failed to claim operation.'); }
+          if (!\\CBZ\\Sync\\Operations::finish($claimA['id'], $workerA, (int)$claimA['claim_generation'], 'done')) { WP_CLI::error('Worker A could not finish its own claim.'); }
+          \\CBZ\\Sync\\Operations::enqueue(777, 'ci_stock', 888, array('qty' => 6));
+          $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$table} WHERE id=%d", $claimA['id']), ARRAY_A);
+          if (!$row || $row['status'] !== 'pending') { WP_CLI::error('A completed operation was not re-queued on a later change.'); }
+          $claimA2 = \\CBZ\\Sync\\Operations::claimNext($workerA, 30);
+          if (!$claimA2) { WP_CLI::error('Worker A could not reclaim re-queued operation.'); }
+          $wpdb->update($table, array('lease_until' => '2000-01-01 00:00:00'), array('id' => (int)$claimA2['id']));
+          $claimB = \\CBZ\\Sync\\Operations::claimNext($workerB, 30);
+          if (!$claimB || (int)$claimB['claim_generation'] <= (int)$claimA2['claim_generation']) { WP_CLI::error('Worker B did not receive a newer fencing generation.'); }
+          if (\\CBZ\\Sync\\Operations::finish($claimA2['id'], $workerA, (int)$claimA2['claim_generation'], 'done')) { WP_CLI::error('Stale worker A incorrectly finished worker B claim.'); }
+          if (!\\CBZ\\Sync\\Operations::finish($claimB['id'], $workerB, (int)$claimB['claim_generation'], 'done')) { WP_CLI::error('Current worker B could not finish its claim.'); }
+          $claimC = \\CBZ\\Sync\\Operations::claimNext($workerC, 30);
+          if (!$claimC) { WP_CLI::error('Completed operation was not re-queued for dirty test.'); }
+          \\CBZ\\Sync\\Operations::enqueue(777, 'ci_stock', 888, array('qty' => 7));
+          $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$table} WHERE id=%d", $claimC['id']), ARRAY_A);
+          if (!$row || (int)$row['dirty'] !== 1) { WP_CLI::error('Change during claim did not set dirty.'); }
+          if (!\\CBZ\\Sync\\Operations::finish($claimC['id'], $workerC, (int)$claimC['claim_generation'], 'done')) { WP_CLI::error('Worker C could not finish dirty operation.'); }
+          $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$table} WHERE id=%d", $claimC['id']), ARRAY_A);
+          if (!$row || $row['status'] !== 'pending' || (int)$row['dirty'] !== 0) { WP_CLI::error('Dirty completion did not schedule a fresh pending pass.'); }
+          WP_CLI::success('Queue idempotency, re-queue, dirty flag and stale-worker fencing passed.');
+          PHP
+          php /tmp/wp-cli.phar eval-file /tmp/chandbazar-queue-test.php --path=/tmp/wp/wordpress
 
       - name: WordPress HTTP smoke test
         run: |
