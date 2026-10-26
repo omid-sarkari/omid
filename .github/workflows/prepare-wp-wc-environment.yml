@@ -118,6 +118,27 @@ jobs:
             --skip-email
 
           php "$GITHUB_WORKSPACE/bundle/tools/wp-cli.phar" plugin activate woocommerce --path="$WP_DIR"
+
+          # Verify the installed stack through both WP-CLI and a real HTTP request.
+          php "$GITHUB_WORKSPACE/bundle/tools/wp-cli.phar" core is-installed --path="$WP_DIR"
+          php "$GITHUB_WORKSPACE/bundle/tools/wp-cli.phar" plugin is-active woocommerce --path="$WP_DIR"
+          php -S 127.0.0.1:8080 -t "$WP_DIR" > "$RUNNER_TEMP/wp-http.log" 2>&1 &
+          WP_SERVER_PID=$!
+          trap 'kill "$WP_SERVER_PID" 2>/dev/null || true' EXIT
+          HTTP_CODE=""
+          for attempt in $(seq 1 20); do
+            HTTP_CODE="$(curl -sS -o "$RUNNER_TEMP/wp-home.html" -w '%{http_code}' http://127.0.0.1:8080/ || true)"
+            [ "$HTTP_CODE" = "200" ] && break
+            sleep 1
+          done
+          if [ "$HTTP_CODE" != "200" ]; then
+            cat "$RUNNER_TEMP/wp-http.log"
+            echo "WordPress HTTP smoke test failed with status: $HTTP_CODE" >&2
+            exit 1
+          fi
+          grep -qi 'woocommerce' "$RUNNER_TEMP/wp-home.html" || true
+          echo "WordPress HTTP smoke test: HTTP $HTTP_CODE"
+
           php "$GITHUB_WORKSPACE/bundle/tools/wp-cli.phar" db export \
             "$GITHUB_WORKSPACE/bundle/database/wordpress.sql" \
             --path="$WP_DIR"
