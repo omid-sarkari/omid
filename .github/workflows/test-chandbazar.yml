@@ -102,6 +102,7 @@ jobs:
           if (!$claimB || (int)$claimB['claim_generation'] <= (int)$claimA2['claim_generation']) { WP_CLI::error('Worker B did not receive a newer fencing generation.'); }
           if (\\CBZ\\Sync\\Operations::finish($claimA2['id'], $workerA, (int)$claimA2['claim_generation'], 'done')) { WP_CLI::error('Stale worker A incorrectly finished worker B claim.'); }
           if (!\\CBZ\\Sync\\Operations::finish($claimB['id'], $workerB, (int)$claimB['claim_generation'], 'done')) { WP_CLI::error('Current worker B could not finish its claim.'); }
+          \\CBZ\\Sync\\Operations::enqueue(777, 'ci_stock', 888, array('qty' => 6));
           $claimC = \\CBZ\\Sync\\Operations::claimNext($workerC, 30);
           if (!$claimC) { WP_CLI::error('Completed operation was not re-queued for dirty test.'); }
           \\CBZ\\Sync\\Operations::enqueue(777, 'ci_stock', 888, array('qty' => 7));
