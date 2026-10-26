@@ -1,0 +1,95 @@
+name: Test ChandBazaar plugin
+on:
+  push:
+    paths:
+      - ".build/**"
+      - ".github/workflows/test-chandbazar.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      mariadb:
+        image: mariadb:11.4
+        env:
+          MARIADB_ROOT_PASSWORD: root
+          MARIADB_DATABASE: wordpress
+          MARIADB_USER: wp
+          MARIADB_PASSWORD: wp
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: curl, dom, fileinfo, gd, intl, mbstring, mysqli, soap, zip, openssl
+          coverage: none
+
+      - name: Reconstruct plugin source archive
+        run: |
+          set -euo pipefail
+          cat .build/chandbazar-dev-plugin.tar.xz.b64 .build/chandbazar-dev-plugin.tar.xz.part1.b64 | base64 -d > /tmp/chandbazar-dev-plugin.tar.xz
+          xz -t /tmp/chandbazar-dev-plugin.tar.xz
+          mkdir -p /tmp/plugin-src
+          tar -xJf /tmp/chandbazar-dev-plugin.tar.xz -C /tmp/plugin-src
+          test -f /tmp/plugin-src/chandbazar/chandbazar.php
+
+      - name: PHP syntax checks
+        run: find /tmp/plugin-src/chandbazar -name '*.php' -print0 | xargs -0 -n1 php -l
+
+      - name: Unit checks
+        run: php /tmp/plugin-src/chandbazar/tests/unit/run.php
+
+      - name: Download pinned WordPress, WooCommerce and WP-CLI
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/wp
+          curl --fail --location --retry 4 https://wordpress.org/wordpress-7.1.3.zip -o /tmp/wordpress.zip
+          unzip -q /tmp/wordpress.zip -d /tmp/wp
+          curl --fail --location --retry 4 https://downloads.wordpress.org/plugin/woocommerce.11.2.1.zip -o /tmp/woocommerce.zip
+          unzip -q /tmp/woocommerce.zip -d /tmp/wp/wordpress/wp-content/plugins
+          curl --fail --location --retry 4 https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o /tmp/wp-cli.phar
+          sudo apt-get update
+          sudo apt-get install -y mariadb-client
+
+      - name: Install WordPress, activate WooCommerce and ChandBazaar
+        env:
+          MYSQL_PWD: wp
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do mariadb -h127.0.0.1 -uwp wordpress -e 'SELECT 1' >/dev/null 2>&1 && break; sleep 2; done
+          mariadb -h127.0.0.1 -uwp wordpress -e 'SELECT 1'
+          php /tmp/wp-cli.phar config create --path=/tmp/wp/wordpress --dbname=wordpress --dbuser=wp --dbpass=wp --dbhost=127.0.0.1 --skip-check
+          php /tmp/wp-cli.phar core install --path=/tmp/wp/wordpress --url=http://127.0.0.1:8080 --title=ChandBazaar-CI --admin_user=ci_admin --admin_password="$(openssl rand -hex 20)" --admin_email=ci@example.invalid --skip-email
+          cp -a /tmp/plugin-src/chandbazar /tmp/wp/wordpress/wp-content/plugins/chandbazar
+          php /tmp/wp-cli.phar plugin activate woocommerce --path=/tmp/wp/wordpress
+          php /tmp/wp-cli.phar plugin activate chandbazar --path=/tmp/wp/wordpress
+          php /tmp/wp-cli.phar cbz status --path=/tmp/wp/wordpress
+          php /tmp/wp-cli.phar eval 'global $wpdb; foreach (array("accounts","product_map","order_map","operations","logs") as $t) { $n=$wpdb->prefix."chandbazar_".$t; if ($wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s",$n)) !== $n) { WP_CLI::error("Missing table: ".$n); } } WP_CLI::success("All ChandBazaar tables exist.");' --path=/tmp/wp/wordpress
+
+      - name: WordPress HTTP smoke test
+        run: |
+          set -euo pipefail
+          php -S 127.0.0.1:8080 -t /tmp/wp/wordpress >/tmp/chandbazar-http.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          for i in $(seq 1 20); do
+            CODE="$(curl -sS -o /tmp/chandbazar-home.html -w '%{http_code}' http://127.0.0.1:8080/ || true)"
+            [ "$CODE" = "200" ] && break
+            sleep 1
+          done
+          if [ "$CODE" != "200" ]; then cat /tmp/chandbazar-http.log; exit 1; fi
+          echo "WordPress returned HTTP $CODE"
